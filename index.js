@@ -1,70 +1,117 @@
+const BASE_URL = "http://4.224.186.213/evaluation-service";
 
-const http = require("http");
-const { fetchNotifications } = require("./notificationService");
-const { getTopN } = require("./priorityQueue");
+// Set your auth token here or via environment variable
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "YOUR_AUTH_TOKEN_HERE";
 
-const PORT = process.env.PORT || 3000;
-const DEFAULT_TOP_N = parseInt(process.env.TOP_N || "10", 10);
+const headers = {
+  Authorization: `Bearer ${AUTH_TOKEN}`,
+  "Content-Type": "application/json",
+};
 
-// ── Router ────────────────────────────────────────────────────────────────────
+// ── Fetch helpers ────────────────────────────────────────────────────────────
 
-function parseUrl(url) {
-  const [path, qs = ""] = url.split("?");
-  const params = Object.fromEntries(new URLSearchParams(qs));
-  return { path, params };
+async function fetchDepots() {
+  const res = await fetch(`${BASE_URL}/depots`, { headers });
+  if (!res.ok) throw new Error(`Depots fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.depots; // [{ ID, MechanicHours }]
 }
 
-async function router(req, res) {
-  const { path, params } = parseUrl(req.url);
+async function fetchVehicles() {
+  const res = await fetch(`${BASE_URL}/vehicles`, { headers });
+  if (!res.ok) throw new Error(`Vehicles fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.vehicles; // [{ TaskID, Duration, Impact }]
+}
 
-  res.setHeader("Content-Type", "application/json");
+// ── Knapsack solver (0/1, DP) ────────────────────────────────────────────────
 
-  try {
-    // Health check
-    if (req.method === "GET" && path === "/health") {
-      return send(res, 200, { status: "ok" });
+/**
+ * Classic 0/1 knapsack.
+ * @param {Array<{TaskID, Duration, Impact}>} tasks
+ * @param {number} capacity  – mechanic-hours budget
+ * @returns {{ selectedTasks: Array, totalImpact: number, totalDuration: number }}
+ */
+function knapsack(tasks, capacity) {
+  const n = tasks.length;
+
+  // dp[i][w] = max impact using first i tasks with capacity w
+  // Use 1-D rolling array to save memory
+  const dp = new Array(capacity + 1).fill(0);
+  const keep = Array.from({ length: n }, () => new Array(capacity + 1).fill(false));
+
+  for (let i = 0; i < n; i++) {
+    const { Duration: w, Impact: v } = tasks[i];
+    for (let c = capacity; c >= w; c--) {
+      if (dp[c - w] + v > dp[c]) {
+        dp[c] = dp[c - w] + v;
+        keep[i][c] = true;
+      }
     }
-
-    // Top-N priority notifications
-    if (req.method === "GET" && path === "/notifications/top") {
-      const n = parseInt(params.n || DEFAULT_TOP_N, 10);
-      if (isNaN(n) || n < 1) return send(res, 400, { error: "Invalid n parameter" });
-
-      const notifications = await fetchNotifications();
-      const topN = getTopN(notifications, n);
-
-      return send(res, 200, {
-        success: true,
-        n,
-        total_fetched: notifications.length,
-        data: topN,
-      });
-    }
-
-    // All notifications (raw, for debugging)
-    if (req.method === "GET" && path === "/notifications/all") {
-      const notifications = await fetchNotifications();
-      return send(res, 200, { success: true, total: notifications.length, data: notifications });
-    }
-
-    return send(res, 404, { error: "Not found" });
-  } catch (err) {
-    console.error("Error:", err.message);
-    return send(res, 500, { error: err.message });
   }
+
+  // Back-track to find selected items
+  const selectedTasks = [];
+  let c = capacity;
+  for (let i = n - 1; i >= 0; i--) {
+    if (keep[i][c]) {
+      selectedTasks.push(tasks[i]);
+      c -= tasks[i].Duration;
+    }
+  }
+
+  const totalImpact = selectedTasks.reduce((s, t) => s + t.Impact, 0);
+  const totalDuration = selectedTasks.reduce((s, t) => s + t.Duration, 0);
+
+  return { selectedTasks, totalImpact, totalDuration };
 }
 
-function send(res, status, body) {
-  res.statusCode = status;
-  res.end(JSON.stringify(body, null, 2));
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log("=== Vehicle Maintenance Scheduler ===\n");
+
+  const [depots, vehicles] = await Promise.all([fetchDepots(), fetchVehicles()]);
+
+  console.log(`Fetched ${depots.length} depots and ${vehicles.length} vehicle tasks.\n`);
+
+  const results = [];
+
+  for (const depot of depots) {
+    const { ID: depotId, MechanicHours: budget } = depot;
+    console.log(`\n--- Depot ${depotId} | Budget: ${budget} mechanic-hours ---`);
+
+    const { selectedTasks, totalImpact, totalDuration } = knapsack(vehicles, budget);
+
+    console.log(`  Selected ${selectedTasks.length} tasks`);
+    console.log(`  Total Duration : ${totalDuration} / ${budget} hours`);
+    console.log(`  Total Impact   : ${totalImpact}`);
+    console.log("  Tasks:");
+    selectedTasks.forEach((t) =>
+      console.log(`    [${t.TaskID}]  duration=${t.Duration}  impact=${t.Impact}`)
+    );
+
+    results.push({
+      depotId,
+      budget,
+      totalDuration,
+      totalImpact,
+      selectedTaskIds: selectedTasks.map((t) => t.TaskID),
+    });
+  }
+
+  console.log("\n=== Summary ===");
+  results.forEach((r) => {
+    console.log(
+      `Depot ${r.depotId}: ${r.selectedTaskIds.length} tasks | ` +
+        `${r.totalDuration}/${r.budget} hours | impact=${r.totalImpact}`
+    );
+  });
+
+  return results;
 }
 
-// ── Start server ──────────────────────────────────────────────────────────────
-
-const server = http.createServer(router);
-server.listen(PORT, () => {
-  console.log(`\n🔔 Campus Notifications Service running on http://localhost:${PORT}`);
-  console.log(`   GET /notifications/top?n=10  – Priority inbox`);
-  console.log(`   GET /notifications/all        – All raw notifications`);
-  console.log(`   GET /health                   – Health check\n`);
+main().catch((err) => {
+  console.error("Fatal error:", err.message);
+  process.exit(1);
 });
